@@ -1,0 +1,199 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Carla</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700;800&family=Barlow:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="/style.css">
+<style>
+body{margin:0}
+.pin{font-family:var(--display);font-weight:800;font-size:clamp(56px,8vw,96px);letter-spacing:.08em;color:var(--fg);line-height:1}
+.qr img{width:240px;height:240px;display:block}
+.chip{font-size:20px;padding:10px 18px}
+.chip.off{opacity:.45}
+.chip button{margin-left:6px;font-weight:800;opacity:.5}
+.chip button:hover{opacity:1}
+.err{color:var(--bad);font-weight:600;min-height:1.4em;margin:0}
+.conn{position:fixed;left:50%;bottom:calc(14px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);background:var(--bad);color:#fff;padding:8px 16px;border-radius:999px;font-weight:600;font-size:14px;z-index:9}
+.ans .k{font-size:28px}
+</style>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand"><span class="ball" aria-hidden="true"></span>Carla</div>
+    <div class="row" id="topRight"></div>
+  </header>
+  <main id="view" aria-live="polite"></main>
+</div>
+<div class="conn" id="conn" hidden>Reconectando…</div>
+<canvas id="fx" aria-hidden="true"></canvas>
+
+<script>
+const LETTERS = ["A","B","C","D"];
+const IS_HOST = location.pathname.startsWith("/presentar");
+const $ = s => document.querySelector(s);
+const view = $("#view"), topRight = $("#topRight");
+const esc = s => String(s ?? "").replace(/[&<>"']/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+const store = { get(k){ try{return localStorage.getItem(k)}catch(e){return null} }, set(k,v){ try{localStorage.setItem(k,v)}catch(e){} } };
+
+/* ---------- sonido y confeti ---------- */
+let ac=null;
+function beep(f=660,len=.09,type="sine",vol=.06){ try{ ac=ac||new (window.AudioContext||window.webkitAudioContext)(); const o=ac.createOscillator(),g=ac.createGain(); o.type=type;o.frequency.value=f;g.gain.value=vol;o.connect(g);g.connect(ac.destination);g.gain.exponentialRampToValueAtTime(.0001,ac.currentTime+len);o.start();o.stop(ac.currentTime+len);}catch(e){} }
+function confetti(){ const cv=$("#fx"),cx=cv.getContext("2d");cv.width=innerWidth;cv.height=innerHeight;const cols=["#ff6a13","#ffb37d","#1f8fe0","#2fd27a","#e8a713","#f4f1ec"];const P=Array.from({length:160},()=>({x:Math.random()*cv.width,y:-20-Math.random()*cv.height*.5,vx:(Math.random()-.5)*3,vy:2+Math.random()*4,s:5+Math.random()*7,r:Math.random()*6,c:cols[Math.random()*cols.length|0]}));let t=0;(function f(){cx.clearRect(0,0,cv.width,cv.height);P.forEach(p=>{p.x+=p.vx;p.y+=p.vy;p.r+=.1;cx.save();cx.translate(p.x,p.y);cx.rotate(p.r);cx.fillStyle=p.c;cx.fillRect(-p.s/2,-p.s/4,p.s,p.s/2);cx.restore()});if(++t<260)requestAnimationFrame(f);else cx.clearRect(0,0,cv.width,cv.height)})(); }
+function timerSVG(left,total){ const r=42,C=2*Math.PI*r,f=Math.max(0,left)/total,col=left<=5?"var(--bad)":"var(--accent)";
+  return `<svg viewBox="0 0 100 100"><circle cx="50" cy="50" r="${r}" fill="none" stroke="var(--line)" stroke-width="9"/><circle cx="50" cy="50" r="${r}" fill="none" stroke="${col}" stroke-width="9" stroke-linecap="round" stroke-dasharray="${C}" stroke-dashoffset="${C*(1-f)}"/></svg><span>${Math.max(0,Math.ceil(left))}</span>`; }
+
+/* ---------- conexión ---------- */
+let ws, S = null, deadline = 0, tick = null, lastKey = "", pendingJoin = null;
+function connect(){
+  ws = new WebSocket((location.protocol==="https:"?"wss://":"ws://") + location.host);
+  ws.onopen = () => { $("#conn").hidden = true; hello(); };
+  ws.onclose = () => { $("#conn").hidden = false; setTimeout(connect, 1500); };
+  ws.onmessage = e => { const m = JSON.parse(e.data); handle(m); };
+}
+const send = m => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(m)); };
+function hello(){
+  if (IS_HOST){ const pw = sessionStorage.getItem("ql_pw"); if (pw) send({t:"host", password:pw}); else renderLogin(); }
+  else { const pid = store.get("ql_pid"), name = store.get("ql_name"), pin = store.get("ql_pin");
+    if (pid && name && pin) send({t:"join", pid, name, pin}); else renderJoin(); }
+}
+function handle(m){
+  if (m.t === "error"){
+    if (m.code === "bad_password"){ sessionStorage.removeItem("ql_pw"); renderLogin("Contraseña incorrecta."); }
+    else { const msg = {bad_pin:"El PIN no es correcto. Míralo en la pantalla.", name_taken:"Ese nombre ya está cogido. Prueba otro.", bad_name:"Escribe tu nombre.", full:"La partida está llena."}[m.code] || "No se ha podido entrar.";
+      store.set("ql_pid",""); renderJoin(msg); }
+    return;
+  }
+  if (m.t === "kicked"){ store.set("ql_pid",""); S=null; renderJoin("La partida ha terminado o te han sacado. Puedes volver a entrar."); return; }
+  if (m.t === "joined"){ store.set("ql_pid", m.pid); store.set("ql_pin", m.pin); beep(880,.07); return; }
+  if (m.t === "state"){
+    const prev = S; S = m;
+    deadline = performance.now() + (m.left || 0);
+    const key = [m.phase,m.qi,m.answered,m.np,m.me?.answer,m.me?.score,(m.players||[]).map(p=>p.name+p.online+p.score).join()].join("|");
+    if (key === lastKey) return; lastKey = key;
+    if (prev && prev.phase !== m.phase){
+      if (m.phase==="ready") beep(600,.1);
+      if (m.phase==="question") beep(880,.14,"triangle");
+      if (m.phase==="reveal") beep(988,.18,"triangle",.06);
+    }
+    if (prev && prev.phase !== m.phase && m.phase==="end") setTimeout(confetti,300);
+    IS_HOST ? renderHost() : renderPlayer();
+  }
+}
+
+/* ---------- PRESENTADOR ---------- */
+function renderLogin(err=""){
+  topRight.innerHTML = "";
+  view.innerHTML = `<div class="phone"><div><div class="eyebrow">Presentador</div><h2 style="font-size:44px;text-transform:uppercase">Abrir la partida</h2></div>
+    <form id="f" class="field"><label for="pw">Contraseña del presentador</label><input id="pw" type="password" autocomplete="current-password" required>
+    <p class="err">${esc(err)}</p><button class="btn" type="submit">Entrar</button></form></div>`;
+  $("#f").onsubmit = e => { e.preventDefault(); const pw=$("#pw").value; sessionStorage.setItem("ql_pw",pw); send({t:"host",password:pw}); };
+}
+function hostTop(){
+  topRight.innerHTML = `<span class="pill"><b>${S.np}</b> jugadores</span>${S.phase!=="lobby"?`<span class="pill">Pregunta <b>${S.qi+1}</b>/${S.n}</span>`:""}`;
+}
+function startTick(fn){ clearInterval(tick); fn(); tick = setInterval(fn, 100); }
+function renderHost(){
+  clearInterval(tick); hostTop();
+  const Q = S.q, P = S.players || [];
+  if (S.phase === "lobby"){
+    view.innerHTML = `<section class="lobby">
+      <div class="join"><div class="eyebrow">Sala abierta</div><h2>Únete desde tu móvil</h2>
+        <ol class="steps"><li>Escanea el <b>código QR</b> con la cámara.</li><li>Escribe tu <b>nombre</b> y pulsa Entrar.</li></ol>
+        <div class="qrbox"><div class="qr"><img src="/qr.svg?pin=${S.pin}" alt="Código QR para unirse"></div>
+        <div class="qrurl">O entra en<br><b style="color:var(--fg);font-size:18px">${esc(location.host)}</b><br>con el PIN<div class="pin">${S.pin}</div></div></div></div>
+      <div><div class="count">${P.length}</div><div class="eyebrow">jugadores conectados</div>
+        <div class="chips">${P.map((p,i)=>`<span class="chip ${p.online?"":"off"}">${esc(p.name)}<button data-k="${i}" aria-label="Sacar a ${esc(p.name)}">×</button></span>`).join("") || `<span class="note">Esperando jugadores…</span>`}</div></div>
+    </section>
+    <div class="ctrl"><button class="btn ghost" id="nr">Nueva sala (nuevo PIN)</button><button class="btn" id="go" ${P.length?"":"disabled"}>Empezar partida</button></div>`;
+    view.querySelectorAll("[data-k]").forEach(b => b.onclick = () => send({t:"kick", i:+b.dataset.k}));
+    $("#go").onclick = () => send({t:"start"});
+    $("#nr").onclick = () => send({t:"newroom"});
+  } else if (S.phase === "ready"){
+    view.innerHTML = `<div class="wait"><div><div class="eyebrow">Pregunta ${S.qi+1} de ${S.n}</div><div class="qtext" style="margin:18px 0">${esc(Q.q)}</div><div class="count" id="c"></div><p>¡Prepárate!</p></div></div>`;
+    startTick(() => { const c=$("#c"); if(c) c.textContent = Math.max(1, Math.ceil((deadline-performance.now())/1000)); });
+  } else if (S.phase === "question"){
+    view.innerHTML = `<div class="qhead"><div class="timer" id="tm"></div><div class="stat"><b>${S.answered}/${S.np}</b><small>respuestas</small></div></div>
+      <div class="qtext">${esc(Q.q)}</div>
+      <div class="answers">${Q.a.map((a,i)=>`<div class="ans c${i}"><span class="k">${LETTERS[i]}</span>${esc(a)}</div>`).join("")}</div>
+      <div class="ctrl"><button class="btn ghost" id="cl">Cerrar respuestas</button></div>`;
+    $("#cl").onclick = () => send({t:"close"});
+    let last = 99;
+    startTick(() => { const left=(deadline-performance.now())/1000, t=$("#tm"); if(t) t.innerHTML=timerSVG(left,S.qs); const s=Math.ceil(left); if(s!==last){ last=s; if(s<=5&&s>0) beep(440,.05,"square",.03); } });
+  } else if (S.phase === "reveal"){
+    view.innerHTML = `<div class="qtext">${esc(Q.q)}</div>
+      <div class="answers">${Q.a.map((a,i)=>`<div class="ans c${i} ${i===S.correct?"right":"dim"}"><span class="k">${LETTERS[i]}</span>${esc(a)}<span class="bar">${i===S.correct?"":S.dist[i]}</span></div>`).join("")}</div>
+      <p class="center note">${S.dist[S.correct]} de ${S.np} acertaron</p>
+      <div class="ctrl"><button class="btn" id="nx">${S.qi===S.n-1?"Ver podio":"Clasificación"}</button></div>`;
+    $("#nx").onclick = () => send({t:"next"});
+  } else if (S.phase === "board"){
+    view.innerHTML = `<h2 class="center big">Clasificación</h2>
+      <div class="board">${P.slice(0,5).map((p,i)=>`<div class="brow" style="animation-delay:${i*70}ms"><span class="pos">${i+1}</span><span class="nm">${esc(p.name)}${p.gain?`<span class="gain">+${p.gain}</span>`:""}</span><span class="pts">${p.score}</span></div>`).join("")}</div>
+      <div class="ctrl"><button class="btn" id="nx">Siguiente pregunta</button></div>`;
+    $("#nx").onclick = () => send({t:"next"});
+  } else if (S.phase === "end"){
+    const slot=(i,cls)=>P[i]?`<div class="step ${cls}"><div class="who">${esc(P[i].name)}</div><div class="sc">${P[i].score} pts</div><div class="blk">${i+1}</div></div>`:`<div class="step ${cls}"></div>`;
+    view.innerHTML = `<h2 class="center big">Podio final</h2><div class="podium">${slot(1,"p2")}${slot(0,"p1")}${slot(2,"p3")}</div>
+      <div class="board">${P.slice(3).map((p,i)=>`<div class="brow"><span class="pos">${i+4}</span><span class="nm">${esc(p.name)}</span><span class="pts">${p.score}</span></div>`).join("")}</div>
+      <div class="ctrl"><button class="btn ghost" id="ag">Jugar otra vez (mismos jugadores)</button><button class="btn ghost" id="nr">Nueva sala</button></div>`;
+    $("#ag").onclick = () => send({t:"again"}); $("#nr").onclick = () => send({t:"newroom"});
+  }
+}
+
+/* ---------- JUGADOR ---------- */
+function renderJoin(err=""){
+  clearInterval(tick); lastKey = ""; topRight.innerHTML = "";
+  const pin = new URLSearchParams(location.search).get("pin") || store.get("ql_pin") || "";
+  view.innerHTML = `<div class="phone"><div><div class="eyebrow">Unirse a la partida</div><h2 style="font-size:44px;text-transform:uppercase">¿Cómo te llamas?</h2></div>
+    <form id="f" class="field">
+      <label for="pin">PIN de la partida</label><input id="pin" inputmode="numeric" maxlength="6" value="${esc(pin)}" required>
+      <label for="nm">Tu nombre</label><input id="nm" maxlength="20" autocomplete="nickname" value="${esc(store.get("ql_name")||"")}" required>
+      <p class="err">${esc(err)}</p><button class="btn" type="submit">Entrar</button></form></div>`;
+  $("#f").onsubmit = e => { e.preventDefault(); const name=$("#nm").value.trim(), p=$("#pin").value.trim(); if(!name) return;
+    store.set("ql_name", name); store.set("ql_pin", p); send({t:"join", name, pin:p, pid: store.get("ql_pid")||null}); };
+}
+function renderPlayer(){
+  clearInterval(tick);
+  const me = S.me || {}, Q = S.q;
+  topRight.innerHTML = `<span class="pill">${esc(me.name||"")}</span>`;
+  const meBar = S.phase!=="lobby" ? `<div class="me"><span>Puesto ${me.rank||"–"}</span><b>${me.score||0} pts</b></div>` : "";
+  if (S.phase === "lobby"){ view.innerHTML = `<div class="phone"><div class="wait"><div><div class="spin"></div><h2>¡Estás dentro!</h2><p>Busca tu nombre en la pantalla. La partida empieza enseguida.</p></div></div></div>`; return; }
+  if (S.phase === "ready"){
+    view.innerHTML = `<div class="phone"><div class="wait"><div><div class="eyebrow">Pregunta ${S.qi+1} de ${S.n}</div><div class="count" id="c"></div><h2>¡Prepárate!</h2></div></div>${meBar}</div>`;
+    startTick(() => { const c=$("#c"); if(c) c.textContent = Math.max(1, Math.ceil((deadline-performance.now())/1000)); });
+    return;
+  }
+  if (S.phase === "question"){
+    if (me.answer != null){ view.innerHTML = `<div class="phone"><div class="wait"><div><div class="spin"></div><h2>Respuesta enviada</h2><p>Has elegido <b>${LETTERS[me.answer]} · ${esc(Q.a[me.answer])}</b></p><p style="margin-top:8px">${S.answered}/${S.np} han respondido</p></div></div>${meBar}</div>`; return; }
+    view.innerHTML = `<div class="phone"><div class="qhead"><div class="eyebrow">Pregunta ${S.qi+1} de ${S.n}</div><div class="timer" id="tm" style="width:64px;height:64px"></div></div>
+      <div class="qtext" style="font-size:24px;padding:16px">${esc(Q.q)}</div>
+      <div class="answers">${Q.a.map((a,i)=>`<button class="ans c${i}" data-i="${i}"><span class="k">${LETTERS[i]}</span>${esc(a)}</button>`).join("")}</div></div>`;
+    view.querySelectorAll(".ans").forEach(b => b.onclick = () => { send({t:"answer", qi:S.qi, c:+b.dataset.i}); beep(620,.06,"triangle"); view.querySelectorAll(".ans").forEach(x=>{x.disabled=true; if(x!==b) x.classList.add("dim");}); });
+    startTick(() => { const left=(deadline-performance.now())/1000, t=$("#tm");
+      if (left<=0){ clearInterval(tick); view.innerHTML = `<div class="phone"><div class="wait"><div><h2>¡Se acabó el tiempo!</h2><p>Esperando la respuesta correcta…</p></div></div>${meBar}</div>`; return; }
+      if(t){ t.innerHTML=timerSVG(left,S.qs); t.querySelector("span").style.fontSize="24px"; } });
+    return;
+  }
+  if (S.phase === "reveal" || S.phase === "board"){
+    const ok = me.answer != null && me.answer === S.correct, cls = me.answer==null?"none":ok?"ok":"bad";
+    view.innerHTML = `<div class="phone"><div class="result ${cls}"><h2>${me.answer==null?"Sin respuesta":ok?"¡Correcto!":"Incorrecto"}</h2>
+      <p>${ok?`+${me.gain} puntos`:`Era: ${LETTERS[S.correct]} · ${esc(Q.a[S.correct])}`}</p></div>${meBar}
+      <div class="wait"><p>${S.phase==="board"?"Mira la clasificación en la pantalla":"Esperando la siguiente pregunta…"}</p></div></div>`;
+    if (ok && S.phase==="reveal") beep(1046,.15,"triangle");
+    return;
+  }
+  if (S.phase === "end"){
+    view.innerHTML = `<div class="phone"><h2 class="center big" style="font-size:52px">${me.rank===1?"¡Has ganado!":me.rank<=3?"¡Estás en el podio!":"Fin de la partida"}</h2>${meBar}
+      <div class="board">${(S.top||[]).map((t,i)=>`<div class="brow"><span class="pos">${i+1}</span><span class="nm">${esc(t[0])}</span><span class="pts">${t[1]}</span></div>`).join("")}</div></div>`;
+    if (me.rank<=3) confetti();
+  }
+}
+
+view.innerHTML = `<div class="wait"><div><div class="spin"></div><p style="margin-top:12px">Conectando…</p></div></div>`;
+connect();
+</script>
+</body>
+</html>
